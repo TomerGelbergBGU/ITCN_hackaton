@@ -1,6 +1,5 @@
 import socket
 import threading
-import time
 from protocol import Protocol
 
 
@@ -14,6 +13,28 @@ class GameClient:
         self.player_name = ""
         self.requested_rounds = 0
         self.cards_seen_in_round = 0
+
+    def calculate_hand(self, cards):
+        """
+        Calculates the value of a hand (list of ranks).
+        Handles Aces (1 or 11) correctly.
+        """
+        value = 0
+        aces = 0
+        for r in cards:
+            if r == 1:  # Ace
+                aces += 1
+                value += 11
+            elif r >= 10:  # Face cards (J, Q, K)
+                value += 10
+            else:
+                value += r
+
+        # אם עברנו את 21 ויש לנו אסים, נהפוך אותם מ-11 ל-1
+        while value > 21 and aces > 0:
+            value -= 10
+            aces -= 1
+        return value
 
     def get_user_params(self):
         """Show menu and get user configuration."""
@@ -47,6 +68,9 @@ class GameClient:
             udp_client.bind(("", self.udp_port))
         except Exception as e:
             print(f"UDP Bind Error: {e}")
+            # במקרה של שגיאה ב-Bind עדיף לצאת או לנסות שוב עם השהיה
+            import time
+            time.sleep(1)
             return None, None
 
         print(f"Listening on UDP port {self.udp_port}...")
@@ -55,15 +79,14 @@ class GameClient:
             try:
                 data, addr = udp_client.recvfrom(1024)
 
-                # --- תיקון 1: קבלת טאפל ולא מילון ---
+                # unpacking returns (port, name)
                 server_port, server_name = Protocol.unpack_offer(data)
 
                 if server_name:
                     print(f"\nReceived offer from server '{server_name}' at {addr[0]}")
+                    udp_client.close()  # סוגרים את ה-UDP לפני המעבר ל-TCP
                     return addr[0], server_port
             except Exception as e:
-                # הוספתי הדפסה כדי שתראה אם יש שגיאות
-                # print(f"UDP Error: {e}")
                 continue
 
     def connect_and_play(self, ip, port):
@@ -76,23 +99,21 @@ class GameClient:
 
             print(f"Sending handshake: Name={self.player_name}")
 
-            # --- תיקון 2: הסדר הנכון של הארגומנטים ---
-            # קודם השם (string), אחר כך מספר הסיבובים (int)
+            # שליחת הודעת פתיחה (שם + מספר סיבובים)
             req_msg = Protocol.pack_request(self.player_name, self.requested_rounds)
-
             self.tcp_socket.sendall(req_msg)
 
             self.game_active = True
 
+            # הפעלת האזנה לשרת ב-Thread נפרד כדי שה-Input לא יתקע את קבלת ההודעות
             listen_thread = threading.Thread(target=self.listen_to_server, daemon=True)
             listen_thread.start()
 
+            # לולאת ה-Input רצה ב-Main Thread
             self.user_input_loop()
 
         except Exception as e:
             print(f"Connection error: {e}")
-            import traceback
-            traceback.print_exc()  # זה ידפיס לך בדיוק איפה הבעיה אם תקרה שוב
         finally:
             if self.tcp_socket:
                 self.tcp_socket.close()
@@ -100,16 +121,19 @@ class GameClient:
             self.game_active = False
 
     def listen_to_server(self):
-        """Listens for messages from the server."""
+        """Listens for messages, tracks both hands, and explains the result."""
 
-        # משתנה שיחזיק את הודעת הסיום
-        # ברירת המחדל: סיום רגיל
+        my_hand_ranks = []
+        dealer_hand_ranks = []
+
+        # רשימה חדשה לשמירת *השמות* של קלפי הדילר להדפסה יפה בסוף
+        dealer_cards_display = []
+
         end_msg = "\nRound ended. Press Enter to continue..."
 
         try:
             while self.game_active:
                 data = self.tcp_socket.recv(1024)
-
                 if not data:
                     print("\nServer closed the connection.")
                     self.game_active = False
@@ -117,48 +141,98 @@ class GameClient:
 
                 status, rank, suit = Protocol.unpack_game_state(data)
 
-                # המרת קלפים לטקסט
+                # המרות טקסט
                 ranks_map = {1: 'Ace', 11: 'Jack', 12: 'Queen', 13: 'King'}
                 suits_map = {0: 'Spades', 1: 'Hearts', 2: 'Diamonds', 3: 'Clubs'}
                 r_str = ranks_map.get(rank, str(rank))
                 s_str = suits_map.get(suit, 'Unknown')
                 card_str = f"[{r_str} of {s_str}]"
 
-                if status == 0:  # ACTIVE
-                    self.cards_seen_in_round += 1
-                    print(f"Server: You got {card_str}")
-                    if self.cards_seen_in_round >= 2:
-                        print("Your move (1-Hit, 2-Stand): ", end="", flush=True)
+                # --- לוגיקה לפי סטטוס ---
 
-                else:  # WIN/LOSS/TIE
+                if status == 0:  # ACTIVE (קלף שלי)
+                    self.cards_seen_in_round += 1
+                    my_hand_ranks.append(rank)
+                    my_score = self.calculate_hand(my_hand_ranks)
+
+                    print(f"Server: You got {card_str} | Your Total: {my_score}")
+
+                    # אם תורי לשחק (יש לי קלפים, ולדילר יש קלף פתוח)
+                    if len(my_hand_ranks) >= 2 and len(dealer_hand_ranks) > 0:
+                        if my_score < 21:
+                            print("Your move (1-Hit, 2-Stand): ", end="", flush=True)
+
+                elif status == 4:  # STATUS_DEALER (קלף דילר)
+                    dealer_hand_ranks.append(rank)
+                    dealer_cards_display.append(card_str)  # שומרים את השם להדפסה בסוף
+
+                    print(f"Dealer shows: {card_str}")
+
+                    # שואלים את השחקן רק אם זה הקלף *הראשון* של הדילר
+                    if len(dealer_hand_ranks) == 1:
+                        my_score = self.calculate_hand(my_hand_ranks)
+                        if len(my_hand_ranks) >= 2 and my_score < 21:
+                            print("Your move (1-Hit, 2-Stand): ", end="", flush=True)
+
+                else:  # WIN (3) / LOSS (2) / DRAW (1) - סיום משחק
                     self.cards_seen_in_round = 0
-                    res_map = {1: "DRAW", 2: "YOU LOST!", 3: "YOU WON!"}
-                    result = res_map.get(status, "Unknown Result")
-                    print(f"\n=== Game Over: {result} (Dealer had: {card_str}) ===")
+
+                    my_final = self.calculate_hand(my_hand_ranks)
+                    dealer_final = self.calculate_hand(dealer_hand_ranks)
+
+                    print("\n" + "=" * 50)  # קו מפריד ארוך יותר
+                    res_text = {1: "DRAW", 2: "YOU LOST!", 3: "YOU WON!"}.get(status, "RESULT")
+                    print(f"=== GAME OVER: {res_text} ===")
+                    print("=" * 50)
+
+                    # --- ההדפסה המסודרת החדשה ---
+                    print(f"YOUR SCORE:   {my_final}")
+
+                    # חיבור כל קלפי הדילר למחרוזת אחת יפה
+                    dealer_cards_str = ", ".join(dealer_cards_display)
+                    print(f"DEALER HAND:  {dealer_cards_str}")
+                    print(f"DEALER SCORE: {dealer_final}")
+                    print("-" * 50)
+
+                    if my_final > 21:
+                        print("Reason: You Busted (went over 21).")
+                    elif dealer_final > 21:
+                        print("Reason: Dealer Busted! You win.")
+                    elif my_final > dealer_final:
+                        print("Reason: Your score is higher than the Dealer's.")
+                    elif my_final < dealer_final:
+                        print("Reason: Dealer's score is higher.")
+                    else:
+                        print("Reason: Scores are equal.")
+                    print("=" * 50)
+
+                    # איפוס רשימות
+                    my_hand_ranks = []
+                    dealer_hand_ranks = []
+                    dealer_cards_display = []
 
         except (ConnectionResetError, ConnectionAbortedError):
             print("\n\nError: The server disconnected unexpectedly!")
             self.game_active = False
-            # משנים את הודעת הסיום למשהו שמתאים לניתוק
-            end_msg = "\nConnection lost. Please press Enter to return to main menu..."
-
-        except socket.error as e:
-            print(f"\n\nNetwork Error: {e}")
-            self.game_active = False
-            end_msg = "\nNetwork Error. Press Enter to continue..."
+            end_msg = "\nConnection lost. Press Enter to return..."
 
         except Exception as e:
             print(f"\n\nGeneral Error: {e}")
             self.game_active = False
-            end_msg = "\nError occurred. Press Enter to continue..."
 
-        # מדפיסים את ההודעה המתאימה (רגילה או שגיאה)
         print(end_msg)
 
     def user_input_loop(self):
+        """
+        לולאה שרצה ב-Main Thread ומחכה לקלט מהמשתמש.
+        ברגע שהמשחק נגמר (game_active=False), הלולאה תישבר כשהמשתמש ילחץ Enter.
+        """
         while self.game_active:
             try:
+                # ה-input כאן הוא "חוסם" (Blocking).
+                # אם השרת מתנתק, אנחנו צריכים שהמשתמש ילחץ Enter כדי לשחרר את החסימה ולצאת מהלולאה.
                 choice = input()
+
                 if not self.game_active: break
 
                 action = ""
@@ -170,8 +244,9 @@ class GameClient:
                     print("Invalid choice. Enter 1 or 2.")
                     continue
 
-                self.tcp_socket.sendall(Protocol.pack_action(action))
-            except:
+                if self.tcp_socket:
+                    self.tcp_socket.sendall(Protocol.pack_action(action))
+            except Exception:
                 break
 
 
