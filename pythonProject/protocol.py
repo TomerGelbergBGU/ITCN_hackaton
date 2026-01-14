@@ -5,21 +5,24 @@ import struct
 class Protocol:
     """
     Protocol class for the Blackijecky game.
-    Handles all packet encoding (packing) and decoding (unpacking).
-    Follows the strict format defined in the Hackathon assignment.
+    Handles all packet encoding/decoding and stores all constants.
     """
 
-    # --- Constants ---
-    # Magic Cookie: 4 bytes, verifies packet validity (0xabcddcba)
-    MAGIC_COOKIE = 0xabcddcba
+    # --- Network Constants ---
+    SERVER_PORT = 13122
+    BROADCAST_IP = '255.255.255.255'
 
-    # Message Types
+    # IP used to determine local interface (Google DNS) - never actually connected to
+    TEST_IP_FOR_INTERFACE = '8.8.8.8'
+    TEST_PORT_FOR_INTERFACE = 80
+
+    BUFFER_SIZE = 1024
+
+    # --- Magic Cookie & Types ---
+    MAGIC_COOKIE = 0xabcddcba
     MSG_TYPE_OFFER = 0x02
     MSG_TYPE_REQUEST = 0x03
     MSG_TYPE_PAYLOAD = 0x04
-
-    # Network Constants
-    SERVER_PORT = 13122  # The fixed UDP port clients listen on
 
     # --- Struct Formats (Big Endian '!') ---
     # Offer: Cookie(I), Type(B), ServerPort(H), ServerName(32s)
@@ -31,23 +34,25 @@ class Protocol:
     # Payload (Client -> Server): Cookie(I), Type(B), Decision(5s)
     FMT_PAYLOAD_CLIENT = '!IB5s'
 
-    # Payload (Server -> Client): Cookie(I), Type(B), Status(B), Rank(H), Suit(B)
+    # Payload (Server -> Client): Cookie(I), Type(B), Status(B), Rank(B), Suit(B)
+    # Note: Using 'B' for Rank/Suit is sufficient (1 byte)
     FMT_PAYLOAD_SERVER = '!IBBHB'
 
-    # --- Helper Methods ---
+    # --- Dynamic Size Calculation ---
+    # We calculate sizes automatically to avoid hard-coded numbers like 9, 10, 38
+    OFFER_MSG_SIZE = struct.calcsize(FMT_OFFER)
+    REQUEST_MSG_SIZE = struct.calcsize(FMT_REQUEST)
+    CLIENT_MSG_SIZE = struct.calcsize(FMT_PAYLOAD_CLIENT)
+    SERVER_MSG_SIZE = struct.calcsize(FMT_PAYLOAD_SERVER)
 
     @staticmethod
     def recv_exactly(sock, size):
-        """
-        Helper function to receive exactly 'size' bytes.
-        This prevents reading too much (coalescing) or too little (fragmentation).
-        """
+        """Helper to ensure we receive exactly 'size' bytes (TCP handling)."""
         data = b''
         while len(data) < size:
             try:
                 chunk = sock.recv(size - len(data))
                 if not chunk:
-                    # אם קיבלנו 0 בייטים, סימן שהצד השני סגר את החיבור
                     raise ConnectionError("Connection closed remotely")
                 data += chunk
             except socket.error as e:
@@ -56,117 +61,64 @@ class Protocol:
 
     @staticmethod
     def _pad_string(text, length):
-        """Helper to pad/truncate a string to a fixed byte length."""
+        """Pads string with null bytes to fixed length."""
         encoded = text.encode('utf-8')
-        if len(encoded) > length:
-            return encoded[:length]
-        return encoded.ljust(length, b'\x00')
+        return encoded[:length].ljust(length, b'\x00')
 
     @staticmethod
     def _decode_string(bytes_data):
-        """Helper to decode bytes to string, removing null padding."""
+        """Decodes string and strips null bytes."""
         return bytes_data.decode('utf-8').rstrip('\x00')
 
-    # --- Packing Methods (Create Bytes) ---
+    # --- Packet Methods ---
 
     @staticmethod
     def pack_offer(server_port, server_name):
-        padded_name = Protocol._pad_string(server_name, 32)
-        return struct.pack(
-            Protocol.FMT_OFFER,
-            Protocol.MAGIC_COOKIE,
-            Protocol.MSG_TYPE_OFFER,
-            server_port,
-            padded_name
-        )
-
-    @staticmethod
-    def pack_request(player_name, num_rounds):
-        padded_name = Protocol._pad_string(player_name, 32)
-        return struct.pack(
-            Protocol.FMT_REQUEST,
-            Protocol.MAGIC_COOKIE,
-            Protocol.MSG_TYPE_REQUEST,
-            num_rounds,
-            padded_name
-        )
-
-    @staticmethod
-    def pack_action(action):
-        if action == "Hit":
-            action_str = "Hittt"
-        elif action == "Stand":
-            action_str = "Stand"
-        else:
-            raise ValueError(f"Invalid action: {action}")
-
-        return struct.pack(
-            Protocol.FMT_PAYLOAD_CLIENT,
-            Protocol.MAGIC_COOKIE,
-            Protocol.MSG_TYPE_PAYLOAD,
-            action_str.encode('utf-8')
-        )
-
-    @staticmethod
-    def pack_game_state(status, rank, suit):
-        return struct.pack(
-            Protocol.FMT_PAYLOAD_SERVER,
-            Protocol.MAGIC_COOKIE,
-            Protocol.MSG_TYPE_PAYLOAD,
-            status,
-            rank,
-            suit
-        )
-
-    # --- Unpacking Methods (Parse Bytes) ---
+        return struct.pack(Protocol.FMT_OFFER, Protocol.MAGIC_COOKIE, Protocol.MSG_TYPE_OFFER, server_port,
+                           Protocol._pad_string(server_name, 32))
 
     @staticmethod
     def unpack_offer(data):
-        if len(data) != struct.calcsize(Protocol.FMT_OFFER):
-            raise ValueError("Invalid offer packet size")
+        if len(data) != Protocol.OFFER_MSG_SIZE: raise ValueError("Invalid Size")
+        cookie, mtype, port, name = struct.unpack(Protocol.FMT_OFFER, data)
+        if cookie != Protocol.MAGIC_COOKIE or mtype != Protocol.MSG_TYPE_OFFER: raise ValueError("Invalid Header")
+        return port, Protocol._decode_string(name)
 
-        cookie, msg_type, port, name_bytes = struct.unpack(Protocol.FMT_OFFER, data)
-
-        if cookie != Protocol.MAGIC_COOKIE or msg_type != Protocol.MSG_TYPE_OFFER:
-            raise ValueError("Invalid Packet Header")
-
-        return port, Protocol._decode_string(name_bytes)
+    @staticmethod
+    def pack_request(player_name, num_rounds):
+        # We ensure num_rounds fits in 1 byte (though logic should handle limits)
+        return struct.pack(Protocol.FMT_REQUEST, Protocol.MAGIC_COOKIE, Protocol.MSG_TYPE_REQUEST, num_rounds,
+                           Protocol._pad_string(player_name, 32))
 
     @staticmethod
     def unpack_request(data):
-        if len(data) != struct.calcsize(Protocol.FMT_REQUEST):
-            raise ValueError("Invalid request packet size")
+        if len(data) != Protocol.REQUEST_MSG_SIZE: raise ValueError("Invalid Size")
+        cookie, mtype, rounds, name = struct.unpack(Protocol.FMT_REQUEST, data)
+        if cookie != Protocol.MAGIC_COOKIE or mtype != Protocol.MSG_TYPE_REQUEST: raise ValueError("Invalid Header")
+        return rounds, Protocol._decode_string(name)
 
-        cookie, msg_type, rounds, name_bytes = struct.unpack(Protocol.FMT_REQUEST, data)
-
-        if cookie != Protocol.MAGIC_COOKIE or msg_type != Protocol.MSG_TYPE_REQUEST:
-            raise ValueError("Invalid Packet Header")
-
-        return rounds, Protocol._decode_string(name_bytes)
+    @staticmethod
+    def pack_action(action):
+        # Normalize to 5 chars logic (Hittt/Stand)
+        act = "Hittt" if action == "Hit" else "Stand"
+        return struct.pack(Protocol.FMT_PAYLOAD_CLIENT, Protocol.MAGIC_COOKIE, Protocol.MSG_TYPE_PAYLOAD,
+                           act.encode('utf-8'))
 
     @staticmethod
     def unpack_action(data):
-        if len(data) != struct.calcsize(Protocol.FMT_PAYLOAD_CLIENT):
-            raise ValueError("Invalid action packet size")
+        if len(data) != Protocol.CLIENT_MSG_SIZE: raise ValueError("Invalid Size")
+        cookie, mtype, act = struct.unpack(Protocol.FMT_PAYLOAD_CLIENT, data)
+        if cookie != Protocol.MAGIC_COOKIE or mtype != Protocol.MSG_TYPE_PAYLOAD: raise ValueError("Invalid Header")
+        return "Hit" if act.decode('utf-8') == "Hittt" else "Stand"
 
-        cookie, msg_type, action_bytes = struct.unpack(Protocol.FMT_PAYLOAD_CLIENT, data)
-
-        if cookie != Protocol.MAGIC_COOKIE or msg_type != Protocol.MSG_TYPE_PAYLOAD:
-            raise ValueError("Invalid Packet Header")
-
-        action_str = action_bytes.decode('utf-8')
-        if action_str == "Hittt":
-            return "Hit"
-        return "Stand"
+    @staticmethod
+    def pack_game_state(status, rank, suit):
+        return struct.pack(Protocol.FMT_PAYLOAD_SERVER, Protocol.MAGIC_COOKIE, Protocol.MSG_TYPE_PAYLOAD, status, rank,
+                           suit)
 
     @staticmethod
     def unpack_game_state(data):
-        if len(data) != struct.calcsize(Protocol.FMT_PAYLOAD_SERVER):
-            raise ValueError("Invalid game state packet size")
-
-        cookie, msg_type, status, rank, suit = struct.unpack(Protocol.FMT_PAYLOAD_SERVER, data)
-
-        if cookie != Protocol.MAGIC_COOKIE or msg_type != Protocol.MSG_TYPE_PAYLOAD:
-            raise ValueError("Invalid Packet Header")
-
+        if len(data) != Protocol.SERVER_MSG_SIZE: raise ValueError("Invalid Size")
+        cookie, mtype, status, rank, suit = struct.unpack(Protocol.FMT_PAYLOAD_SERVER, data)
+        if cookie != Protocol.MAGIC_COOKIE or mtype != Protocol.MSG_TYPE_PAYLOAD: raise ValueError("Invalid Header")
         return status, rank, suit

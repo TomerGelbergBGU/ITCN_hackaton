@@ -5,7 +5,7 @@ from protocol import Protocol
 
 class GameClient:
     def __init__(self):
-        self.udp_port = 13122
+        self.udp_port = Protocol.SERVER_PORT
         self.tcp_socket = None
         self.running = True
         self.game_active = False
@@ -14,7 +14,7 @@ class GameClient:
         self.requested_rounds = 0
         self.rounds_played = 0
 
-        # True = תורי, False = תור הדילר
+        # True = My turn, False = Dealer's turn
         self.my_turn = True
 
     def calculate_hand(self, cards):
@@ -59,7 +59,8 @@ class GameClient:
 
         try:
             udp_client.bind(("", self.udp_port))
-        except:
+        except Exception as e:
+            print(f"UDP Bind Error: {e}")
             import time;
             time.sleep(1)
             return None, None
@@ -67,7 +68,8 @@ class GameClient:
         print(f"Listening on UDP port {self.udp_port}...")
         while True:
             try:
-                data, addr = udp_client.recvfrom(1024)
+                # Use Constant BUFFER_SIZE
+                data, addr = udp_client.recvfrom(Protocol.BUFFER_SIZE)
                 port, name = Protocol.unpack_offer(data)
                 if name:
                     print(f"\nFound server '{name}' at {addr[0]}")
@@ -86,7 +88,10 @@ class GameClient:
             self.tcp_socket.sendall(Protocol.pack_request(self.player_name, self.requested_rounds))
             self.game_active = True
 
+            # Start listener thread
             threading.Thread(target=self.listen_to_server, daemon=True).start()
+
+            # Main loop for user input
             self.user_input_loop()
 
         except Exception as e:
@@ -104,8 +109,8 @@ class GameClient:
 
         try:
             while self.game_active:
-                # 1. Receive packet
-                data = Protocol.recv_exactly(self.tcp_socket, 9)
+                # 1. Receive packet using FIXED SIZE from Protocol
+                data = Protocol.recv_exactly(self.tcp_socket, Protocol.SERVER_MSG_SIZE)
                 status, rank, suit = Protocol.unpack_game_state(data)
 
                 # Format card string
@@ -115,49 +120,46 @@ class GameClient:
 
                 if status == 0:  # --- ACTIVE ROUND ---
                     if len(my_hand) < 2:
-                        # 2 קלפים ראשונים שלי
+                        # First 2 cards for me
                         my_hand.append(rank)
                         val = self.calculate_hand(my_hand)
                         print(f"Server: You got {card_str} | Total: {val}")
 
-                        # מקרה קצה: בלאקג'ק על ההתחלה (21)
+                        # Edge case: Blackjack on start
                         if len(my_hand) == 2 and val == 21:
                             print("Blackjack! Waiting for dealer...")
                             self.my_turn = False
 
                     elif len(dealer_hand) == 0:
-                        # קלף ראשון של דילר
+                        # Dealer's first exposed card
                         dealer_hand.append(rank)
                         dealer_display.append(card_str)
                         print(f"Dealer shows: {card_str}")
 
-                        # אם לא סיימתי את התור שלי (כי הגעתי ל21), מבקש קלט
                         if self.my_turn:
                             print("Your move (1-Hit, 2-Stand): ", end="", flush=True)
                     else:
-                        # המשך משחק
+                        # Mid-game
                         if self.my_turn:
                             my_hand.append(rank)
                             val = self.calculate_hand(my_hand)
                             print(f"Server: You got {card_str} | Total: {val}")
 
-                            # === התיקון הקריטי כאן ===
-                            # אם הגעתי ל-21 או עברתי, התור עובר לדילר אוטומטית
+                            # Auto Stand if 21 or Busted
                             if val >= 21:
                                 self.my_turn = False
                                 print("Automatic Stand (21 or Bust). Waiting for dealer...")
                             else:
                                 print("Your move (1-Hit, 2-Stand): ", end="", flush=True)
                         else:
-                            # תור הדילר
+                            # Dealer draws
                             dealer_hand.append(rank)
                             dealer_display.append(card_str)
                             print(f"Dealer draws: {card_str}")
 
-                else:  # --- ROUND OVER ---
-                    # Logic fix for last card duplication
+                else:  # --- ROUND OVER (Status 1, 2, 3) ---
+                    # Logic fix: Add last card to dealer if it wasn't mine
                     my_val = self.calculate_hand(my_hand)
-                    # אם הקלף האחרון הוא לא שלי (כי עמדתי), נוסיף לדילר
                     if my_val <= 21 and not self.my_turn:
                         is_dup = False
                         if dealer_display and dealer_display[-1] == card_str:
@@ -174,12 +176,13 @@ class GameClient:
                     print("=" * 40)
 
                     self.rounds_played += 1
+
                     if self.rounds_played < self.requested_rounds:
                         print("Starting next round...")
                     else:
                         print("Final round finished. Waiting for server to close connection...")
 
-                    # RESET
+                    # --- RESET FOR NEXT ROUND ---
                     my_hand = []
                     dealer_hand = []
                     dealer_display = []
@@ -192,12 +195,14 @@ class GameClient:
     def user_input_loop(self):
         while self.game_active:
             try:
+                # Blocking input
                 choice = input()
                 if not self.game_active: break
+
+                # Ignore empty inputs (like 'Enter' from previous round)
                 if not choice.strip(): continue
 
                 if choice == '1':
-                    # בדיקה מקומית - אם כבר אי אפשר למשוך
                     if not self.my_turn:
                         print("Wait for dealer...")
                         continue

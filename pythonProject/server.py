@@ -6,11 +6,11 @@ from protocol import Protocol
 
 # --- Game Constants ---
 SUITS = [0, 1, 2, 3]  # Spades, Hearts, Diamonds, Clubs
-RANKS = list(range(1, 14))  # 1-13
+RANKS = list(range(1, 14))  # 1-13 (Ace=1, J=11, Q=12, K=13)
 
-# Status codes (Official only!)
+# Protocol Status Codes
 STATUS_ACTIVE = 0
-STATUS_TIE = 1
+STATUS_DRAW = 1
 STATUS_LOSS = 2
 STATUS_WIN = 3
 
@@ -31,165 +31,161 @@ class GameServer:
 
         print(f"Server started on IP: {self.server_ip}, TCP Port: {self.server_port}")
 
+        # Start Broadcast Thread
+        threading.Thread(target=self.broadcast_offers, daemon=True).start()
+
     def _get_local_ip(self):
+        """Finds local IP without hardcoding '8.8.8.8' in logic flow."""
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80))
+            s.connect((Protocol.TEST_IP_FOR_INTERFACE, Protocol.TEST_PORT_FOR_INTERFACE))
             ip = s.getsockname()[0]
             s.close()
             return ip
         except Exception:
             return "127.0.0.1"
 
-    def start(self):
-        # Start UDP Broadcast
-        udp_thread = threading.Thread(target=self.broadcast_offers, daemon=True)
-        udp_thread.start()
-
-        # Main Loop
-        try:
-            while self.running:
-                print("Waiting for clients...")
-                client_sock, addr = self.tcp_socket.accept()
-                print(f"New connection from {addr}")
-                threading.Thread(target=self.handle_client, args=(client_sock,)).start()
-        except KeyboardInterrupt:
-            self.running = False
-
     def broadcast_offers(self):
-        udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-
-        # BIND TO IP: Important for correct network interface selection
-        try:
-            udp_sock.bind((self.server_ip, 0))
-        except:
-            pass
-
+        """Broadcasts UDP offers every 1 second."""
+        udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        dest_addr = ('255.255.255.255', Protocol.SERVER_PORT)
+
+        packet = Protocol.pack_offer(self.server_port, self.server_name)
+        dest_addr = (Protocol.BROADCAST_IP, Protocol.SERVER_PORT)
+
+        print(f"Broadcasting offers to {dest_addr}...")
 
         while self.running:
             try:
-                msg = Protocol.pack_offer(self.server_port, self.server_name)
-                udp_sock.sendto(msg, dest_addr)
+                udp_sock.sendto(packet, dest_addr)
                 time.sleep(1)
-            except:
-                pass
+            except Exception as e:
+                print(f"Broadcast error: {e}")
+                time.sleep(1)
 
-    # --- Game Logic ---
-
-    def get_deck(self):
-        deck = [(r, s) for r in RANKS for s in SUITS]
-        random.shuffle(deck)
-        return deck
-
-    def calculate_hand(self, cards):
-        value = 0
-        aces = 0
-        for rank, suit in cards:
-            if rank == 1:
-                aces += 1
-                value += 1
-            elif rank > 10:
-                value += 10
-            else:
-                value += rank
-        while aces > 0 and value + 10 <= 21:
-            value += 10
-            aces -= 1
-        return value
+    def start(self):
+        """Main loop: Accept TCP connections."""
+        print("Waiting for clients...")
+        while self.running:
+            try:
+                conn, addr = self.tcp_socket.accept()
+                print(f"New connection from {addr}")
+                threading.Thread(target=self.handle_client, args=(conn,), daemon=True).start()
+            except Exception as e:
+                print(f"Accept error: {e}")
 
     def handle_client(self, conn):
         try:
-            # 1. Handshake
-            data = conn.recv(38)
-            if not data: return
-            num_rounds, player_name = Protocol.unpack_request(data)
-            print(f"Player '{player_name}' connected for {num_rounds} rounds.")
+            # 1. Receive Request
+            data = Protocol.recv_exactly(conn, Protocol.REQUEST_MSG_SIZE)
+            rounds, player_name = Protocol.unpack_request(data)
+            print(f"Player '{player_name}' connected for {rounds} rounds.")
 
-            # 2. Play Rounds
-            for i in range(num_rounds):
-                print(f"--- Round {i + 1} for {player_name} ---")
+            # 2. Game Loop
+            for i in range(1, rounds + 1):
+                # print(f"--- Round {i} for {player_name} ---")
                 self.play_round(conn)
 
-            print(f"Finished rounds for {player_name}.")
+            print(f"Finished games with {player_name}. Closing.")
+
         except Exception as e:
             print(f"Error handling client: {e}")
         finally:
             conn.close()
 
+    def calculate_hand(self, cards):
+        value = 0
+        aces = 0
+        for r, s in cards:
+            if r == 1:
+                aces += 1; value += 11
+            elif r >= 10:
+                value += 10
+            else:
+                value += r
+
+        while value > 21 and aces > 0:
+            value -= 10
+            aces -= 1
+        return value
+
     def play_round(self, conn):
-        deck = self.get_deck()
+        deck = [(r, s) for r in RANKS for s in SUITS]
+        random.shuffle(deck)
+
         player_cards = [deck.pop(), deck.pop()]
         dealer_cards = [deck.pop(), deck.pop()]
 
-        # 1. Send Initial Cards (All STATUS 0)
-        # Player Card 1
-        conn.sendall(Protocol.pack_game_state(STATUS_ACTIVE, player_cards[0][0], player_cards[0][1]))
-        time.sleep(0.05)
-        # Player Card 2
-        conn.sendall(Protocol.pack_game_state(STATUS_ACTIVE, player_cards[1][0], player_cards[1][1]))
-        time.sleep(0.05)
-        # Dealer Visible Card
-        conn.sendall(Protocol.pack_game_state(STATUS_ACTIVE, dealer_cards[0][0], dealer_cards[0][1]))
+        # Send initial cards (Player 1, Player 2, Dealer 1)
+        # Note: Dealer's second card is hidden
+        initial_sends = [
+            (player_cards[0], STATUS_ACTIVE),
+            (player_cards[1], STATUS_ACTIVE),
+            (dealer_cards[0], STATUS_ACTIVE)
+        ]
 
-        # 2. Player Turn
+        for card, status in initial_sends:
+            conn.sendall(Protocol.pack_game_state(status, card[0], card[1]))
+            time.sleep(0.05)  # Small buffer for network stability
+
+        # --- Player Turn ---
         player_active = True
-        while player_active:
-            if self.calculate_hand(player_cards) >= 21:
-                break  # Auto stand/bust
 
+        # Quick check for Blackjack (21)
+        if self.calculate_hand(player_cards) == 21:
+            player_active = False
+
+        while player_active:
             try:
-                data = conn.recv(10)
-                if not data: break
+                data = Protocol.recv_exactly(conn, Protocol.CLIENT_MSG_SIZE)
                 action = Protocol.unpack_action(data)
 
                 if action == "Hit":
                     new_card = deck.pop()
                     player_cards.append(new_card)
-
-                    # Send new card (STATUS 0)
                     conn.sendall(Protocol.pack_game_state(STATUS_ACTIVE, new_card[0], new_card[1]))
 
-                    if self.calculate_hand(player_cards) > 21:
-                        # Busted! Send Loss immediately
-                        conn.sendall(Protocol.pack_game_state(STATUS_LOSS, new_card[0], new_card[1]))
-                        return
+                    if self.calculate_hand(player_cards) >= 21:
+                        player_active = False  # Busted or 21
                 else:
                     player_active = False  # Stand
-            except:
-                break
 
-        # 3. Dealer Turn
-        # Reveal hidden card (Send as STATUS 0)
+            except Exception:
+                return  # Connection lost
+
+        # --- Dealer Turn ---
+        # Reveal hidden card
         conn.sendall(Protocol.pack_game_state(STATUS_ACTIVE, dealer_cards[1][0], dealer_cards[1][1]))
-        time.sleep(0.05)
 
-        d_val = self.calculate_hand(dealer_cards)
-        p_val = self.calculate_hand(player_cards)
+        player_val = self.calculate_hand(player_cards)
+        dealer_val = self.calculate_hand(dealer_cards)
 
-        # Dealer draws
-        while d_val < 17:
-            new_card = deck.pop()
-            dealer_cards.append(new_card)
-            d_val = self.calculate_hand(dealer_cards)
-            conn.sendall(Protocol.pack_game_state(STATUS_ACTIVE, new_card[0], new_card[1]))
-            time.sleep(0.05)
+        # Dealer draws only if player didn't bust
+        if player_val <= 21:
+            while dealer_val < 17:
+                time.sleep(0.5)  # Simulate thinking
+                new_card = deck.pop()
+                dealer_cards.append(new_card)
+                dealer_val = self.calculate_hand(dealer_cards)
+                conn.sendall(Protocol.pack_game_state(STATUS_ACTIVE, new_card[0], new_card[1]))
 
-        # 4. Result
-        if d_val > 21:
-            status = STATUS_WIN
-        elif p_val > d_val:
-            status = STATUS_WIN
-        elif p_val < d_val:
+        # --- Result ---
+        status = STATUS_DRAW
+        if player_val > 21:
             status = STATUS_LOSS
-        else:
-            status = STATUS_TIE
+        elif dealer_val > 21:
+            status = STATUS_WIN
+        elif player_val > dealer_val:
+            status = STATUS_WIN
+        elif player_val < dealer_val:
+            status = STATUS_LOSS
 
-        last = dealer_cards[-1]
-        conn.sendall(Protocol.pack_game_state(status, last[0], last[1]))
+        # Send FINAL result packet (with dummy cards or last card, doesn't matter much here)
+        # We re-send the last dealer card just to conform to format, but status is key.
+        last_card = dealer_cards[-1]
+        conn.sendall(Protocol.pack_game_state(status, last_card[0], last_card[1]))
 
 
 if __name__ == "__main__":
-    server = GameServer()
-    server.start()
+    srv = GameServer()
+    srv.start()
